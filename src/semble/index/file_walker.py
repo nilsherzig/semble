@@ -61,24 +61,18 @@ def walk_files(root: Path, extensions: Sequence[str], ignore: Sequence[str] | No
     :yield: Path to each file under root matching the criteria.
     :ytype: Path
     """
-    # This should be a list. Traversal is done in order, so the order matters.
-    ignored = []
-    extensions_as_patterns = [f"!*{ext}" for ext in extensions]
-    ignored.extend(extensions_as_patterns)
-    ignored.extend(sorted(_DEFAULT_IGNORED_DIRS))
-    # Always give user patterns preference
-    ignored.extend(ignore or [])
-    base_spec = GitIgnoreSpec.from_lines(ignored, backend="simple")
+    extensions_set = frozenset(extensions)
+    dir_patterns = list(sorted(_DEFAULT_IGNORED_DIRS)) + list(ignore or [])
+    base_spec = GitIgnoreSpec.from_lines(dir_patterns, backend="simple")
     s = IgnoreSpec(base=root, spec=base_spec)
-    yield from _walk(root, [s])
+    yield from _walk(root, [s], extensions_set)
 
 
-def _is_ignored(path: Path, specs: list[IgnoreSpec]) -> bool:
+def _is_ignored(path: Path, specs: list[IgnoreSpec]) -> tuple[bool, bool]:
     """Check if a path is ignored by any of the provided ignore specs."""
     is_dir = path.is_dir()
-    # Everything starts off as unignored
-    ignored = not is_dir
-
+    ignored = False
+    found = False
     for ignore_spec in specs:
         try:
             # If there is no relative path, this is invalid.
@@ -100,13 +94,20 @@ def _is_ignored(path: Path, specs: list[IgnoreSpec]) -> bool:
 
             if pattern.match_file(relative_str) is not None:
                 ignored = pattern.include
+                # Bypass extension filter only for negation patterns with a file
+                # extension suffix (e.g. !special.kjs, !*.py). Patterns without
+                # a suffix (e.g. !vendor/, !.github/*) target directories or
+                # broad globs and should not bypass extension filtering.
+                pat = pattern.pattern or ""
+                found = not ignored and bool(Path(pat.rstrip("/")).suffix)
 
-    return ignored
+    return ignored, found
 
 
 def _walk(
     directory: Path,
     inherited_specs: list[IgnoreSpec],
+    extensions: frozenset[str],
 ) -> Iterator[Path]:
     """Recursive function for walking files under a directory."""
     spec = _load_ignore_for_dir(directory)
@@ -120,10 +121,11 @@ def _walk(
         # Don't follow symlinks
         if item.is_symlink():
             continue
-        if _is_ignored(item, inherited_specs):
+        is_ignored, found = _is_ignored(item, inherited_specs)
+        if is_ignored:
             continue
 
         if item.is_dir():
-            yield from _walk(item, inherited_specs)
-        elif item.is_file():
+            yield from _walk(item, inherited_specs, extensions)
+        elif item.is_file() and (found or item.suffix.lower() in extensions):
             yield item

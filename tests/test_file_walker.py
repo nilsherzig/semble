@@ -56,6 +56,27 @@ def _touch(path: Path, content: str = "x = 1\n") -> None:
             "out/*\n!out/deep/keep.py\n",
             set(),
         ),
+        # Explicit file negation bypasses extension filter: !special.kjs is yielded even if .kjs is not in extensions.
+        (
+            ["special.kjs", "other.kjs", "main.py"],
+            None,
+            "*.kjs\n!special.kjs\n",
+            {"main.py", "special.kjs"},
+        ),
+        # Glob negation without suffix does NOT bypass extension filter.
+        (
+            [".github/workflows/ci.yaml", "src/main.py"],
+            None,
+            "!.github/*\n",
+            {"src/main.py"},
+        ),
+        # Directory negation does NOT bypass extension filter: files inside vendor/ still need a matching extension.
+        (
+            ["vendor/special.kjs", "vendor/main.py"],
+            None,
+            "*\n!vendor/\n",
+            {"vendor/main.py"},
+        ),
     ],
 )
 def test_walk_files_filtering(
@@ -85,9 +106,9 @@ def test_walk_files_prunes_ignored_dirs(tmp_path: Path) -> None:
 def test_is_ignored_skips_spec_with_unrelated_base(tmp_path: Path) -> None:
     """An IgnoreSpec whose base is not an ancestor of the path is silently skipped.
 
-    Files default to ignored in _is_ignored.  When the first spec has an
-    unrelated base, the ValueError is caught and the spec is skipped without
-    crashing.  A second spec with the correct base can still un-ignore the file.
+    When the first spec has an unrelated base, the ValueError is caught and the
+    spec is skipped without crashing. A second spec with the correct base can
+    still ignore the file.
     """
     from pathspec import GitIgnoreSpec
 
@@ -108,18 +129,20 @@ def test_is_ignored_skips_spec_with_unrelated_base(tmp_path: Path) -> None:
         spec=GitIgnoreSpec.from_lines(["*.py"]),
     )
 
-    # With only the unrelated spec the file stays in its default state (ignored)
+    # With only the unrelated spec the file is not ignored (spec is skipped),
     # and, crucially, no exception is raised.
-    assert _is_ignored(target_file, [unrelated_spec]) is True
+    ignored, _ = _is_ignored(target_file, [unrelated_spec])
+    assert ignored is False
 
-    # Spec rooted at project_a that un-ignores .py files
+    # Spec rooted at project_a that ignores .py files
     matching_spec = IgnoreSpec(
         base=project_a,
-        spec=GitIgnoreSpec.from_lines(["!*.py"]),
+        spec=GitIgnoreSpec.from_lines(["*.py"]),
     )
 
-    # The unrelated spec is safely skipped; the matching spec un-ignores the file.
-    assert _is_ignored(target_file, [unrelated_spec, matching_spec]) is False
+    # The unrelated spec is safely skipped; the matching spec ignores the file.
+    ignored, _ = _is_ignored(target_file, [unrelated_spec, matching_spec])
+    assert ignored is True
 
 
 def test_walk_files_skips_symlinks(tmp_path: Path) -> None:
