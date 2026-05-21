@@ -13,9 +13,9 @@ from bm25s import BM25
 
 from semble.index.create import create_index_from_path
 from semble.index.dense import SelectableBasicBackend, load_model
-from semble.search import search_bm25, search_hybrid, search_semantic
+from semble.search import _search_semantic, search
 from semble.stats import save_search_stats
-from semble.types import CallType, Chunk, Encoder, IndexStats, SearchMode, SearchResult
+from semble.types import CallType, Chunk, Encoder, IndexStats, SearchResult
 
 _GIT_CLONE_TIMEOUT = int(os.environ.get("SEMBLE_CLONE_TIMEOUT", 60))
 
@@ -178,7 +178,7 @@ class SembleIndex:
         """
         target = source.chunk if isinstance(source, SearchResult) else source
         selector = self._get_selector_vector(filter_languages=[target.language]) if target.language else None
-        results = search_semantic(target.content, self.model, self._semantic_index, self.chunks, top_k + 1, selector)
+        results = _search_semantic(target.content, self.model, self._semantic_index, self.chunks, top_k + 1, selector)
         results = [r for r in results if r.chunk != target][:top_k]
         save_search_stats(results, CallType.FIND_RELATED, self._file_sizes)
         return results
@@ -199,16 +199,15 @@ class SembleIndex:
         self,
         query: str,
         top_k: int = 10,
-        mode: SearchMode | str = SearchMode.HYBRID,
         alpha: float | None = None,
         filter_languages: list[str] | None = None,
         filter_paths: list[str] | None = None,
+        rerank: bool = True,
     ) -> list[SearchResult]:
         """Search the index and return the top-k most relevant chunks.
 
         :param query: Natural-language or keyword query string.
         :param top_k: Maximum number of results to return.
-        :param mode: Search strategy — "hybrid" (default), "semantic", or "bm25".
         :param alpha: Blend weight for hybrid score combination; 1.0 = full semantic
             weight, 0.0 = full BM25 weight. File-path penalties and diversity reranking
             are applied regardless. ``None`` auto-detects from query type.
@@ -216,8 +215,8 @@ class SembleIndex:
             these languages are returned.
         :param filter_paths: Optional list of repo-relative file paths; if set, only
             chunks from these files are returned.
+        :param rerank: Whether to rerank the top-k results using custom reranking logic.
         :return: Ranked list of :class:`SearchResult` objects, best match first.
-        :raises ValueError: If `mode` is not a recognised search strategy.
         """
         bm25_index, semantic_index = self._bm25_index, self._semantic_index
         if not self.chunks or not query.strip():
@@ -225,15 +224,16 @@ class SembleIndex:
 
         selector = self._get_selector_vector(filter_languages, filter_paths)
 
-        if mode == SearchMode.BM25:
-            results = search_bm25(query, bm25_index, self.chunks, top_k, selector=selector)
-        elif mode == SearchMode.SEMANTIC:
-            results = search_semantic(query, self.model, semantic_index, self.chunks, top_k, selector=selector)
-        elif mode == SearchMode.HYBRID:
-            results = search_hybrid(
-                query, self.model, semantic_index, bm25_index, self.chunks, top_k, alpha=alpha, selector=selector
-            )
-        else:
-            raise ValueError(f"Unknown search mode: {mode!r}")
+        results = search(
+            query,
+            self.model,
+            semantic_index,
+            bm25_index,
+            self.chunks,
+            top_k,
+            alpha=alpha,
+            selector=selector,
+            rerank=rerank,
+        )
         save_search_stats(results, CallType.SEARCH, self._file_sizes)
         return results

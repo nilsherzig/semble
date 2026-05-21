@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 import watchfiles
 from mcp.server.fastmcp import FastMCP
@@ -63,10 +63,6 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
     async def search(
         query: Annotated[str, Field(description="Natural language or code query.")],
         repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
-        mode: Annotated[
-            Literal["hybrid", "semantic", "bm25"],
-            Field(description="Search mode. 'hybrid' is best for most queries."),
-        ] = "hybrid",
         top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 5,
     ) -> str:
         """Search a codebase with a natural-language or code query.
@@ -78,10 +74,10 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
             return str(exc)
-        results = index.search(query, top_k=top_k, mode=mode)
+        results = index.search(query, top_k=top_k)
         if not results:
             return "No results found."
-        return _format_results(f"Search results for: {query!r} (mode={mode})", results)
+        return _format_results(f"Search results for: {query!r}", results)
 
     @server.tool()
     async def find_related(
@@ -118,26 +114,56 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
 
 async def serve(path: str | None = None, ref: str | None = None, include_text_files: bool = False) -> None:
     """Start an MCP stdio server, optionally pre-indexing a default source."""
-    model = await asyncio.to_thread(load_model)
-    cache = _IndexCache(model=model, include_text_files=include_text_files)
-    if path:
-        await cache.get(path, ref=ref)
-        if not _is_git_url(path):
-            await cache.start_watcher(path)
+    cache = _IndexCache(include_text_files=include_text_files)
 
+    async def _load_and_prewarm() -> None:
+        """Pre-load the model and optionally pre-index the default source in parallel with starting the server."""
+        try:
+            cache._model = await asyncio.to_thread(load_model)
+        except Exception as exc:
+            logger.exception("Failed to load embedding model")
+            cache._model_error = exc
+            return
+        finally:
+            cache._model_ready.set()
+        if path:
+            try:
+                await cache.get(path, ref=ref)
+            except Exception:
+                logger.warning("Failed to pre-index %r at startup", path, exc_info=True)
+            if not _is_git_url(path):
+                await cache.start_watcher(path)
+
+    init_task = asyncio.create_task(_load_and_prewarm())
     server = create_server(cache, default_source=path)
-    await server.run_stdio_async()
+    try:
+        await server.run_stdio_async()
+    finally:
+        if not init_task.done():
+            init_task.cancel()
 
 
 class _IndexCache:
     """Cache of indexed repos and local paths for the lifetime of the MCP server process."""
 
-    def __init__(self, model: Encoder, include_text_files: bool = False) -> None:
-        """Initialise an empty cache with a shared embedding model."""
-        self._model = model
+    def __init__(self, model: Encoder | None = None, include_text_files: bool = False) -> None:
+        """Initialise an empty cache."""
+        self._model: Encoder | None = model
+        self._model_error: BaseException | None = None
+        self._model_ready = asyncio.Event()
+        if model is not None:
+            self._model_ready.set()
         self._include_text_files = include_text_files
         self._tasks: OrderedDict[str, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
         self._watcher_task: asyncio.Task[None] | None = None
+
+    async def _await_model(self) -> Encoder:
+        """Block until the model is installed; re-raise the load error if it failed."""
+        await self._model_ready.wait()
+        if self._model_error is not None:
+            raise self._model_error
+        assert self._model is not None
+        return self._model
 
     def _compute_cache_key(self, source: str, ref: str | None = None) -> str:
         """Compute the canonical cache key for a source."""
@@ -167,27 +193,32 @@ class _IndexCache:
         """Return an index for the requested source, building and caching it on first access."""
         cache_key = self._compute_cache_key(source, ref)
 
-        if cache_key in self._tasks:
-            self._tasks.move_to_end(cache_key)
-        else:
-            if len(self._tasks) >= _CACHE_MAX_SIZE:
-                self._tasks.popitem(last=False)
-            if _is_git_url(source):
-                self._tasks[cache_key] = asyncio.create_task(
-                    asyncio.to_thread(
-                        SembleIndex.from_git,
-                        source,
-                        ref=ref,
-                        model=self._model,
-                        include_text_files=self._include_text_files,
+        if cache_key not in self._tasks:
+            model = await self._await_model()
+            # Re-check after the await: another caller may have populated the entry.
+            if cache_key not in self._tasks:
+                if len(self._tasks) >= _CACHE_MAX_SIZE:
+                    self._tasks.popitem(last=False)
+                if _is_git_url(source):
+                    self._tasks[cache_key] = asyncio.create_task(
+                        asyncio.to_thread(
+                            SembleIndex.from_git,
+                            source,
+                            ref=ref,
+                            model=model,
+                            include_text_files=self._include_text_files,
+                        )
                     )
-                )
-            else:
-                self._tasks[cache_key] = asyncio.create_task(
-                    asyncio.to_thread(
-                        SembleIndex.from_path, cache_key, model=self._model, include_text_files=self._include_text_files
+                else:
+                    self._tasks[cache_key] = asyncio.create_task(
+                        asyncio.to_thread(
+                            SembleIndex.from_path,
+                            cache_key,
+                            model=model,
+                            include_text_files=self._include_text_files,
+                        )
                     )
-                )
+        self._tasks.move_to_end(cache_key)
         task = self._tasks[cache_key]
         try:
             return await asyncio.shield(task)

@@ -5,11 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from semble.cli import _CLAUDE_FILE_PATH, _cli_main, _run_init, main
-from semble.types import SearchMode, SearchResult
+from semble.cli import Agent, _agent_path, _cli_main, _run_init, main
+from semble.types import SearchResult
 from tests.conftest import make_chunk
 
-_CLAUDE_AGENT_FILE = files("semble").joinpath("agents/semble-search.md").read_text(encoding="utf-8")
+_CLAUDE_FILE_PATH = _agent_path(Agent.CLAUDE)
 
 
 @pytest.mark.parametrize(
@@ -32,7 +32,7 @@ def test_main_calls_asyncio_run(argv: list[str], monkeypatch: pytest.MonkeyPatch
     "argv, expected_in_output",
     [
         (["semble", "search", "query text", "/some/path"], ["query text", "0.9"]),
-        (["semble", "search", "nothing", "/some/path", "--top-k", "3", "--mode", "bm25"], ["No results found"]),
+        (["semble", "search", "nothing", "/some/path", "--top-k", "3"], ["No results found"]),
     ],
 )
 def test_cli_search(
@@ -45,9 +45,7 @@ def test_cli_search(
     chunk = make_chunk("def foo(): pass", "src/foo.py")
     fake_index = MagicMock()
     has_results = "No results" not in expected_in_output[0]
-    fake_index.search.return_value = (
-        [SearchResult(chunk=chunk, score=0.9, source=SearchMode.HYBRID)] if has_results else []
-    )
+    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)] if has_results else []
     monkeypatch.setattr(sys, "argv", argv)
     with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
         _cli_main()
@@ -76,9 +74,7 @@ def test_cli_find_related(
     chunk = make_chunk("class Bar: pass", "src/bar.py")
     fake_index = MagicMock()
     fake_index.chunks = [] if scenario == "unknown_chunk" else [chunk]
-    fake_index.find_related.return_value = (
-        [SearchResult(chunk=chunk, score=0.8, source=SearchMode.SEMANTIC)] if scenario == "with_results" else []
-    )
+    fake_index.find_related.return_value = [SearchResult(chunk=chunk, score=0.8)] if scenario == "with_results" else []
     file_path = "unknown.py" if scenario == "unknown_chunk" else "src/bar.py"
     monkeypatch.setattr(sys, "argv", ["semble", "find-related", file_path, "1", "/some/path"])
     with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
@@ -95,14 +91,18 @@ def test_cli_find_related(
         assert expected_stderr in captured.err
 
 
-def test_init_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """_run_init writes the agent file and prints its path."""
+@pytest.mark.parametrize("agent", list(Agent))
+def test_init_creates_file(
+    agent: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_run_init writes the correct agent file for every supported agent."""
     monkeypatch.chdir(tmp_path)
-    _run_init()
-    dest = tmp_path / _CLAUDE_FILE_PATH
+    _run_init(agent=agent)
+    dest = tmp_path / _agent_path(agent)
+    expected = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
     assert dest.exists()
-    assert dest.read_text(encoding="utf-8") == _CLAUDE_AGENT_FILE
-    assert str(_CLAUDE_FILE_PATH) in capsys.readouterr().out
+    assert dest.read_text(encoding="utf-8") == expected
+    assert str(_agent_path(agent)) in capsys.readouterr().out
 
 
 def test_init_refuses_overwrite_without_force(
@@ -124,7 +124,7 @@ def test_init_overwrites_with_force(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text("old content", encoding="utf-8")
     _run_init(force=True)
-    assert dest.read_text(encoding="utf-8") == _CLAUDE_AGENT_FILE
+    assert dest.read_text(encoding="utf-8") == files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8")
 
 
 def test_init_via_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -143,7 +143,7 @@ def test_main_dispatches_to_cli(
     """main() routes to _cli_main when first argument is a CLI subcommand."""
     chunk = make_chunk("def foo(): pass", "src/foo.py")
     fake_index = MagicMock()
-    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9, source=SearchMode.HYBRID)]
+    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)]
     monkeypatch.setattr(sys, "argv", ["semble", "search", "query text", "/some/path"])
     with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
         main()
@@ -167,7 +167,7 @@ def test_cli_entrypoint_works_without_mcp_installed(
     """CLI entrypoint paths succeed even when the mcp package is not installed."""
     chunk = make_chunk("def foo(): pass", "src/foo.py")
     fake_index = MagicMock()
-    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9, source=SearchMode.HYBRID)]
+    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)]
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setitem(sys.modules, "mcp", None)
     monkeypatch.setitem(sys.modules, "mcp.server", None)
@@ -197,7 +197,7 @@ def test_mcp_main_exits_with_message_when_extras_missing(
 
 def test_agent_file_tools_are_bash_only() -> None:
     """The agent file must list only Bash and Read — no MCP tools that require schema loading."""
-    frontmatter = _CLAUDE_AGENT_FILE.split("---")[1]
+    frontmatter = files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8").split("---")[1]
     tools_line = next(line for line in frontmatter.splitlines() if line.startswith("tools:"))
     tools = [t.strip() for t in tools_line.removeprefix("tools:").split(",")]
     assert set(tools) == {"Bash", "Read"}, f"Unexpected tools in agent file: {tools}"
